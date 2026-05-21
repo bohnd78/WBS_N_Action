@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# 가상환경
+env_WBS_N_Action/
+venv/
+.env
+
+# DB (민감 데이터)
+project_agent.db
+
+# 로그
+streamlit.log
+nohup.out
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# Streamlit 캐시
+.streamlit/
