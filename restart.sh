@@ -17,7 +17,7 @@ SCRIPT_DIR="${0:A:h}"
 [[ "$SCRIPT_DIR" == "/bin" || "$SCRIPT_DIR" == "/usr/bin" ]] && SCRIPT_DIR="$PWD"
 
 VENV_STREAMLIT="$SCRIPT_DIR/env_WBS_N_Action/bin/streamlit"
-DEFAULT_PORT=8553
+DEFAULT_PORT=8577
 PORT="${1:-$DEFAULT_PORT}"
 
 is_port_in_use() {
