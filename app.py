@@ -1491,13 +1491,307 @@ def render_admin_tab():
                 st.success("✅ LLM 설정 저장 완료!")
 
 
+# ── 음성 메모 탭 ─────────────────────────────────
+def render_voice_tab():
+    import voice_processor as vp
+
+    st.subheader("🎙️ 음성 메모 → WBS / Action Item 변환")
+    st.markdown(
+        "현장 미팅·출장 음성 파일을 업로드하면 **자동 텍스트 변환 → AI 분석 → WBS/Action 매칭**까지 처리합니다."
+    )
+
+    # ── 환경 체크 배너 ─────────────────────────────
+    has_whisper = vp.HAS_WHISPER
+    has_ffmpeg  = vp.HAS_FFMPEG
+    if not has_whisper or not has_ffmpeg:
+        missing = []
+        if not has_whisper: missing.append("`pip install faster-whisper`")
+        if not has_ffmpeg:  missing.append("`pip install ffmpeg-python` + `brew install ffmpeg`")
+        st.error("⚠️ 필수 패키지 미설치: " + " | ".join(missing))
+        st.stop()
+
+    api_key  = db.get_llm_setting("api_key")
+    base_url = db.get_llm_setting("base_url")
+    model    = db.get_llm_setting("model", "gpt-4o-mini")
+
+    # ── Step 1: 파일 업로드 ─────────────────────────
+    st.markdown("### Step 1 · 음성 파일 업로드")
+    col_up1, col_up2, col_up3 = st.columns([3, 2, 2])
+    with col_up1:
+        audio_file = st.file_uploader(
+            "음성 파일 선택", type=["m4a","mp3","wav","ogg","aac","flac"],
+            label_visibility="collapsed",
+        )
+    with col_up2:
+        lang = st.selectbox("언어", ["ko","en","ja","zh"], index=0,
+                            format_func=lambda x: {"ko":"한국어","en":"영어","ja":"일본어","zh":"중국어"}[x])
+    with col_up3:
+        model_size = st.selectbox("Whisper 모델", ["tiny","small","medium"],
+                                  index=1,
+                                  format_func=lambda x: {
+                                      "tiny":  "tiny  (빠름·낮은정확도)",
+                                      "small": "small (균형 ✅)",
+                                      "medium":"medium (느림·높은정확도)",
+                                  }[x])
+
+    if not audio_file:
+        st.info("💡 .m4a .mp3 .wav .ogg 파일을 업로드하세요.")
+        return
+
+    file_bytes = audio_file.read()
+    file_ext   = audio_file.name.rsplit(".", 1)[-1]
+    st.markdown(
+        f'<div style="background:#0f172a;border:1px solid #334155;border-radius:8px;padding:10px 14px;'
+        f'font-size:.85rem;color:#94a3b8">'
+        f'📎 <b style="color:#f1f5f9">{audio_file.name}</b> &nbsp; '
+        f'{len(file_bytes)/1024:.0f} KB</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Step 2: 음성→텍스트 변환 ─────────────────────
+    st.markdown("### Step 2 · 음성 텍스트 변환 (Whisper STT)")
+    if st.button("▶ 변환 시작", type="primary", use_container_width=False):
+        with st.spinner(f"🎙️ Whisper `{model_size}` 모델로 변환 중... (첫 실행 시 모델 다운로드 포함)"):
+            try:
+                full_text, segments = vp.transcribe_audio(
+                    file_bytes, file_ext, model_size=model_size, language=lang
+                )
+                st.session_state["voice_transcript"] = full_text
+                st.session_state["voice_segments"]   = segments
+                st.session_state.pop("voice_analysis", None)  # 재분석 초기화
+                st.success(f"✅ 변환 완료 — {len(full_text)}자")
+            except Exception as e:
+                st.error(f"❌ 변환 실패: {e}")
+
+    # 변환 결과 표시
+    if "voice_transcript" in st.session_state:
+        transcript = st.session_state["voice_transcript"]
+        segments   = st.session_state.get("voice_segments", [])
+
+        st.markdown("#### 📝 변환된 텍스트")
+        edited_transcript = st.text_area(
+            "", value=transcript, height=180, label_visibility="collapsed",
+            key="voice_transcript_edit",
+            help="내용 수정 후 AI 분석 가능"
+        )
+        st.session_state["voice_transcript"] = edited_transcript
+
+        if segments:
+            with st.expander(f"⏱️ 타임스탬프 세부 내용 ({len(segments)}개 구간)", expanded=False):
+                for seg in segments:
+                    st.markdown(
+                        f'<span style="color:#64748b;font-size:.78rem">[{seg["start"]}s ~ {seg["end"]}s]</span> '
+                        f'{seg["text"]}',
+                        unsafe_allow_html=True,
+                    )
+
+        st.divider()
+
+        # ── Step 3: AI 분석 ──────────────────────────
+        st.markdown("### Step 3 · AI 분석 — WBS / Action Item 추출")
+        if not api_key and not base_url:
+            st.warning("⚙️ LLM 미설정 — [시스템/데이터 관리] 탭 → LLM 설정에서 API Key 또는 Ollama URL을 입력하세요.")
+        else:
+            if st.button("🤖 AI 분석 실행", type="primary"):
+                with st.spinner("AI가 WBS·Action Item 후보를 분석 중..."):
+                    try:
+                        analysis = vp.analyze_transcript(
+                            edited_transcript, api_key=api_key, base_url=base_url, model=model
+                        )
+                        # WBS 매칭
+                        all_wbs = db.get_all_wbs_flat()
+                        analysis["wbs_matched"] = vp.match_wbs_candidates(
+                            analysis.get("wbs_candidates", []), all_wbs
+                        )
+                        analysis["action_matched"] = vp.match_action_candidates(
+                            analysis.get("action_candidates", []), all_wbs
+                        )
+                        analysis["source_filename"] = audio_file.name
+                        st.session_state["voice_analysis"] = analysis
+                    except Exception as e:
+                        st.error(f"❌ AI 분석 오류: {e}")
+
+    # ── Step 4: 리뷰 & 저장 ──────────────────────────
+    if "voice_analysis" in st.session_state:
+        analysis = st.session_state["voice_analysis"]
+
+        st.markdown("### Step 4 · 결과 리뷰 & 저장")
+
+        # 요약 박스
+        st.markdown(
+            f'<div style="background:#0f172a;border:1px solid #7c3aed55;border-left:4px solid #7c3aed;'
+            f'border-radius:8px;padding:12px 16px;margin:8px 0">'
+            f'<div style="font-size:.75rem;color:#a78bfa;letter-spacing:.06em">AI 요약</div>'
+            f'<div style="color:#f1f5f9;margin-top:6px">{analysis.get("summary","")}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        meta_cols = st.columns(3)
+        meta_cols[0].metric("미팅 날짜", analysis.get("meeting_date") or "-")
+        meta_cols[1].metric("참석자", ", ".join(analysis.get("attendees") or []) or "-")
+        meta_cols[2].metric(
+            "후보 항목",
+            f"WBS {len(analysis.get('wbs_matched',[]))}건 + Action {len(analysis.get('action_matched',[]))}건"
+        )
+
+        st.markdown("---")
+
+        # ── WBS 후보 체크박스 ──────────────────────────
+        wbs_matched = analysis.get("wbs_matched", [])
+        sel_new_wbs = []
+        if wbs_matched:
+            st.markdown("#### 📂 WBS 후보")
+            st.caption("✅ = 기존 WBS 매칭됨 | 🆕 = 신규 생성 | 체크박스로 저장할 항목 선택")
+            for i, m in enumerate(wbs_matched):
+                cand = m["candidate"]
+                matched = m["matched"]
+                conf   = m["confidence"]
+
+                conf_color = {"high": "#22c55e", "medium": "#f59e0b", "none": "#64748b"}[conf]
+                conf_icon  = {"high": "✅ 기존 매칭", "medium": "🟡 유사 매칭", "none": "🆕 신규"}[conf]
+
+                label_html = (
+                    f'{conf_icon} &nbsp; <b>{cand.get("wbs_type","")}</b>'
+                    f'<span style="color:#64748b;font-size:.78rem"> [{cand.get("wbs_category","")}]'
+                    f' {"→ 기존: " + matched["wbs_type"] if matched else ""}</span>'
+                )
+                st.markdown(
+                    f'<div style="background:#0f172a;border:1px solid {conf_color}44;'
+                    f'border-left:3px solid {conf_color};border-radius:6px;'
+                    f'padding:6px 12px;margin:4px 0;font-size:.85rem">{label_html}</div>',
+                    unsafe_allow_html=True,
+                )
+                c1, c2 = st.columns([1, 10])
+                with c1:
+                    checked = st.checkbox("", key=f"vwbs_chk_{i}",
+                                         value=(conf == "none"),  # 신규만 기본 체크
+                                         label_visibility="collapsed")
+                with c2:
+                    if matched and conf != "none":
+                        st.caption(f"→ 기존 WBS ID {matched['id']} 사용 (저장 불필요)")
+                    elif checked:
+                        st.caption(f"코드: {cand.get('wbs_code_hint','')} | 이유: {cand.get('reason','')}")
+                if checked and not matched:
+                    sel_new_wbs.append(cand)
+
+        # ── Action 후보 체크박스 ───────────────────────
+        action_matched = analysis.get("action_matched", [])
+        sel_actions = []
+        if action_matched:
+            st.markdown("#### ✅ Action Item 후보")
+            st.caption("저장할 항목을 선택하세요")
+            for i, act in enumerate(action_matched):
+                wbs_id = act.get("matched_wbs_id")
+                wbs_label = ""
+                if wbs_id:
+                    all_w = db.get_all_wbs_flat()
+                    match = [w for w in all_w if w["id"] == wbs_id]
+                    wbs_label = f"🔗 {match[0]['wbs_type']}" if match else ""
+                else:
+                    wbs_label = "📌 WBS 미귀속 (독립 Action)"
+
+                st.markdown(
+                    f'<div style="background:#0f172a;border:1px solid #0891b255;'
+                    f'border-left:3px solid #0891b2;border-radius:6px;'
+                    f'padding:6px 12px;margin:4px 0;font-size:.85rem">'
+                    f'<b>{act.get("action_type","")}</b> — {act.get("content","")[:80]}'
+                    f'<span style="color:#64748b;font-size:.76rem"> | 기한: {act.get("due_date") or "-"} | {wbs_label}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                c1, c2 = st.columns([1, 10])
+                with c1:
+                    checked = st.checkbox("", key=f"vact_chk_{i}", value=True,
+                                         label_visibility="collapsed")
+                with c2:
+                    st.caption(f"{wbs_label} | 담당: {act.get('owner') or '-'}")
+                if checked:
+                    sel_actions.append({**act, "matched_wbs_id": wbs_id})
+
+        st.markdown("---")
+
+        # ── 저장 버튼 ──────────────────────────────────
+        sv1, sv2, sv3 = st.columns(3)
+        with sv1:
+            if st.button("💾 선택 항목 DB 저장", type="primary", use_container_width=True,
+                         disabled=(not sel_new_wbs and not sel_actions)):
+                saved_wbs = 0
+                saved_act = 0
+                wbs_id_map = {}  # wbs_type → new_id (방금 생성한 WBS)
+
+                # 신규 WBS 저장
+                for cand in sel_new_wbs:
+                    code = cand.get("wbs_code_hint", "") or ""
+                    par_id = None
+                    if code and "." in code:
+                        parent_code = ".".join(code.split(".")[:-1])
+                        flat = db.get_all_wbs_flat()
+                        pmatch = [w for w in flat if w.get("wbs_code") == parent_code]
+                        if pmatch:
+                            par_id = pmatch[0]["id"]
+                    lvl = ((db.get_wbs_by_id(par_id) or {}).get("wbs_level", 0) + 1) if par_id else 1
+                    new_id = db.insert_wbs(dict(
+                        wbs_category=cand.get("wbs_category", ""),
+                        wbs_type=cand.get("wbs_type", ""),
+                        content=cand.get("reason", ""),
+                        start_date="", due_date="", status="scheduled",
+                        progress=0, owner="",
+                        wbs_code=code, wbs_level=lvl, parent_wbs_id=par_id,
+                    ))
+                    wbs_id_map[cand.get("wbs_type", "")] = new_id
+                    saved_wbs += 1
+
+                # Action 저장
+                for act in sel_actions:
+                    wbs_id = act.get("matched_wbs_id")
+                    # 방금 생성한 WBS에 연결 시도
+                    if not wbs_id:
+                        hint = act.get("wbs_ref_hint", "")
+                        if hint:
+                            wbs_id = wbs_id_map.get(hint)
+                    db.insert_action(dict(
+                        action_type=act.get("action_type", ""),
+                        content=act.get("content", ""),
+                        start_date="",
+                        due_date=act.get("due_date", ""),
+                        status=act.get("status", "todo"),
+                        wbs_id=wbs_id,
+                        notes=f"음성 메모 자동 추출: {audio_file.name}",
+                    ))
+                    saved_act += 1
+
+                st.success(f"✅ WBS {saved_wbs}건 + Action {saved_act}건 저장 완료!")
+                st.session_state.pop("voice_analysis", None)
+                st.rerun()
+
+        with sv2:
+            # 회의록 .md 내보내기
+            md_note = vp.make_meeting_note_md(
+                edited_transcript, analysis, audio_file.name
+            )
+            safe_name = audio_file.name.rsplit(".", 1)[0].replace(" ", "_")
+            st.download_button(
+                "⬇️ 회의록 .md 내보내기", data=md_note.encode("utf-8"),
+                file_name=f"Meeting_{safe_name}.md", mime="text/markdown",
+                use_container_width=True,
+            )
+
+        with sv3:
+            if st.button("🔄 새 음성 파일 처리", use_container_width=True):
+                for k in ["voice_transcript", "voice_segments", "voice_analysis"]:
+                    st.session_state.pop(k, None)
+                st.rerun()
+
+
 # ── 메인 ─────────────────────────────────────────
 def main():
     render_header()
-    tab_wbs, tab_act, tab_upload, tab_gantt, tab_agent, tab_admin = st.tabs([
+    tab_wbs, tab_act, tab_upload, tab_voice, tab_gantt, tab_agent, tab_admin = st.tabs([
         "📋 WBS 관리",
         "✅ Action Items",
-        "📤 노트 업로드",
+        "📤 Obsidian 연동",
+        "🎙️ 음성 메모",
         "📊 Gantt & 대시보드",
         "🤖 AI 에이전트",
         "⚙️ 시스템/데이터 관리",
@@ -1505,6 +1799,7 @@ def main():
     with tab_wbs:    render_wbs_tab()
     with tab_act:    render_action_tab()
     with tab_upload: render_upload_tab()
+    with tab_voice:  render_voice_tab()
     with tab_gantt:  render_gantt_tab()
     with tab_agent:  render_agent_tab()
     with tab_admin:  render_admin_tab()
